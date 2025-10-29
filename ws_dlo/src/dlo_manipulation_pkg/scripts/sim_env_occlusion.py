@@ -1,0 +1,450 @@
+#!/usr/bin/env python
+
+# main node of the simulation
+# bridge between the Unity Simulator and the controller scripts, based on 'mlagents' and 'gym'
+
+import numpy as np
+from matplotlib import pyplot as plt
+import time
+import sys
+import os
+import rospy
+from mlagents_envs.base_env import ActionTuple
+from mlagents_envs.environment import UnityEnvironment
+from mlagents_envs.side_channel.engine_configuration_channel import EngineConfigurationChannel
+from mlagents_envs.side_channel.environment_parameters_channel import EnvironmentParametersChannel
+import gymnasium as gym
+# import gym
+from gym_unity.envs import UnityToGymWrapper
+
+from utils.state_index import I
+from geometry_msgs.msg import Vector3
+
+
+from data_utils import GraphDataset, get_graph_data, concat_np_pos, to_pixels
+from GN_model_DLO import MySimulator
+import torch
+from torch.nn.functional import mse_loss
+from sklearn.metrics import mean_squared_error
+import cv2
+import numpy as np
+
+# from ws_dlo.src.dlo_manipulation_pkg.scripts.occlusion_prediction.test_dataset_all_miss import mysimulator
+
+loss_fn = mse_loss
+
+DEVICE = torch.device(f'cuda:{0}')
+
+class Args:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+args = Args(
+    lr=1,
+    outf="occlusion_results/adam_offline_yaw_d",
+    model_path="occlusion_models/net_epoch_100_iter_1856.pth",
+    resume_epoch=0,
+    n_epoch=200,
+    batch_size=32,
+    node_input_dim=5,
+    edge_input_dim=2,
+    use_yaw_d=True,
+    yaw_scale = 1,
+    num_fp=8,
+    fast_mode=False,
+    train_nets = [5,6,7,8,9,10,11],
+    adam_lr = 0.1
+)
+
+
+# ---------------------------------- Load Test Model -----------------#
+def re_load_weights (mysimulator, model_path):
+    layers_to_load = []
+    mysimulator.my_load_weights(model_path, layers_to_load)
+    # make virtual systems to be same as main systems
+    mysimulator.load_weights_main_virtual()
+    # Freeze subnets 0 to 4
+    for i in range(5):  # subnets[0] to subnets[4] inclusive
+        for param in mysimulator.subnets[i].parameters():
+            param.requires_grad = False
+
+    for i, subnet in enumerate(mysimulator.subnets):
+        if i in args.train_nets:
+            subnet.alpha0 = 1
+            subnet.alpha1 = 0
+            subnet.lr = args.lr
+
+    for i, subnet in enumerate(mysimulator.subnets_v):
+        if i in args.train_nets:
+            subnet.alpha0 = 0
+            subnet.alpha1 = 1
+            subnet.lr = args.lr
+
+def lr_times_factor(mysimulator, factor):
+    for i, subnet in enumerate(mysimulator.subnets):
+        if i in args.train_nets:
+            subnet.alpha0 = factor
+            subnet.alpha1 = 0
+
+    for i, subnet in enumerate(mysimulator.subnets_v):
+        if i in args.train_nets:
+            subnet.alpha0 = 0
+            subnet.alpha1 = factor
+
+control_method = rospy.get_param("controller/control_law")
+if control_method == 'ours':
+    from controller_ours import Controller
+
+class Environment(object):
+    def __init__(self):
+        self.project_dir = rospy.get_param("project_dir")
+        env_dim = rospy.get_param("env/dimension")
+        self.num_fps = rospy.get_param("DLO/num_FPs")
+
+        engine_config_channel = EngineConfigurationChannel()
+        env_params_channel = EnvironmentParametersChannel()
+
+        # use the built Unity environment
+        env_file = self.project_dir + "env_dlo/env_" + env_dim
+        unity_env = UnityEnvironment(file_name=env_file, seed=1, side_channels=[engine_config_channel, env_params_channel])
+        engine_config_channel.set_configuration_parameters(width=1280, height=720, time_scale=2.0)  # speed x2
+        
+        self.env = UnityToGymWrapper(unity_env)
+        self.controller = Controller()
+        self.control_input = np.zeros((12, ))
+
+    def update_state_data(self,state, num_fp):
+        state_input = state[I.state_input_idx]
+        fp_pos = state_input[3:27].reshape(num_fp, 3)  # ground truth
+        fp_pos_copy = fp_pos.copy()
+        # copy current state
+        state_copy = state.copy()
+
+        return state_input, fp_pos, fp_pos_copy, state_copy
+
+    # -------------------------------------------------------------------
+    def mainLoop(self):
+
+        mysimulator = MySimulator(args).to(DEVICE)
+        re_load_weights(mysimulator, args.model_path)
+        # optimizer = torch.optim.Adam(mysimulator.parameters(), lr=1e-5)
+        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, mysimulator.parameters()), lr=args.adam_lr)
+
+        num_fp = 8  # example number of feature points (adapt as needed)
+        last_pred_fp_pos = None
+        last_drop_fp_idx = []
+
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')  # or use 'XVID' 'h264'
+        out_rollout = cv2.VideoWriter('rollout_pred_data.mp4', fourcc, 5, (1920, 1080))
+        frame = 0
+        data_count = 0
+
+        # Folder to save images
+        save_dir = "saved_images"
+        os.makedirs(save_dir, exist_ok=True)  # Create folder if not exists
+
+        rollout_idx = 0
+        # the first second in unity is not stable, so we do nothing in the first second
+        for k in range(10):
+            state, reward, done, _ = self.env.step(self.control_input)
+            state[I.left_end_avel_idx + I.right_end_avel_idx] /= 2*np.pi  # change the unit of the input angular velocity from rad/s  to 2pi*rad/s
+            state_input, fp_pos, last_pred_fp_pos, observed_state = self.update_state_data(state, num_fp)
+
+        while not rospy.is_shutdown():
+
+            frame+=1
+
+            # num_drop = np.random.randint(0, num_fp+1)  # can drop between 0 and all fps
+            #
+            # # randomly select which fps to drop
+            # if num_drop > 0:
+            #     dropout_fp_idx = np.random.choice(np.arange(num_fp), size=num_drop, replace=False)
+            # else:
+            #     dropout_fp_idx = []
+
+            # self.control_input = self.controller.generateControlInput(state).copy()
+            self.control_input = self.controller.generateControlInput(observed_state).copy()
+            self.control_input[[3, 4, 5, 9, 10, 11]] *= 2*np.pi  # change the unit of the output angular velocity from 2pi*rad/s  torad/s
+
+            state, reward, done, _ = self.env.step(self.control_input)
+            state[I.left_end_avel_idx + I.right_end_avel_idx] /= 2*np.pi # change the unit of the input angular velocity from rad/s  to 2pi*rad/s
+
+            state_input, fp_pos, observed_fp_pos, observed_state = self.update_state_data(state, num_fp) #fp_pos is ground truth
+            # observed state is a copy, and replace "missing points" with predictions
+            target_pos = state[I.desired_pos_idx].reshape(num_fp+2, 3)[:,:2]
+
+
+            #-------------------------------- Rectangular area ----------------------------#
+            # 1. Compute overall target bounds
+            x_min, y_min = np.min(target_pos[[1,2,3,4,5,6,7,8],:2], axis=0)
+            x_max, y_max = np.max(target_pos[[1,2,3,4,5,6,7,8],:2], axis=0)
+
+            # # 2. Randomly choose rectangle size and position within target bounds
+            # rect_width = (x_max - x_min) * np.random.uniform(0.2, 0.5)  # 20–50% of target width
+            # rect_height = (y_max - y_min) * np.random.uniform(0.2, 0.5)  # 20–50% of target height
+
+            rect_width = (x_max - x_min) * 1  # 20–50% of target width
+            rect_height = (y_max - y_min) * 1 # 20–50% of target height
+
+
+            # x0 = x_min - 0.25*rect_width
+            # y0 = y_min - 0.25*rect_height
+            #
+            # x1 = x_max + 0.25*rect_width
+            # y1 = y_max + 0.25*rect_height
+            #
+
+            x0 = x_min - 0*rect_width
+            y0 = y_min - 0*rect_height
+
+            x1 = x_max + 0*rect_width
+            y1 = y_max + 0*rect_height
+
+
+
+            # 3. Check which fp_pos points fall inside the rectangle
+            inside_mask = (
+                    (fp_pos[:, 0] >= x0) & (fp_pos[:, 0] <= x1) &
+                    (fp_pos[:, 1] >= y0) & (fp_pos[:, 1] <= y1)
+            )
+
+            # 4. Get indices of the covered / missing points
+            missing_idx = np.where(inside_mask)[0]
+
+
+            dropout_fp_idx = list(missing_idx)
+            # lst = [0,1,2,3,4,5,6,7]
+            # see_fp_idx = [x for x in lst if x not in dropout_fp_idx]
+
+            # dropout_fp_idx = [2,4,6]
+
+            print("missing_idx", dropout_fp_idx)
+            # print("can see idx", see_fp_idx)
+            # -------------------------------------------------------------------------------------------------------------
+
+
+            # X, Xd, R, Rd (input for graph prediction)
+            fp_pos_data = last_pred_fp_pos[:,:2] #(8,2)
+            end_pos_data =  state_input[30:].reshape(2, 7)[:, [0, 1, 5]] # x,y,_ last end pos is meaningless, just to make size consistent
+            fp_pos_d_data = state[I.fps_vel_idx][3:27].reshape(num_fp, 3)[:, :2]
+            end_pos_d_data = state[I.ends_vel_idx].reshape(2, 6)[:, [0, 1, 5]] # x,y,yaw
+
+
+            delta_t = np.array(0.1)
+
+            #ground truth pos
+            x_true, y_true = to_pixels(torch.tensor(concat_np_pos(fp_pos[:,:2], end_pos_data[:,:2])), 1920, 1080, x_range=(-1, 1), y_range=(-1, 1))
+            x_target, y_target = to_pixels(torch.tensor(target_pos), 1920, 1080,
+                                       x_range=(-1, 1), y_range=(-1, 1))
+
+            # # ------------------------ replace missing with last known values ---------------#
+            observed_fp_pos[dropout_fp_idx,:2] = last_pred_fp_pos[dropout_fp_idx,:2]
+
+            # -------------------------- replace missing with GNN predictions -----------------#
+
+            # data_new = get_graph_data(fp_pos_data, fp_pos_d_data, end_pos_data, end_pos_d_data, delta_t, use_yaw_d=args.use_yaw_d,yaw_scale=args.yaw_scale)
+            # data_new = data_new.to(DEVICE)
+            #
+            # pred_pos = torch.tensor(concat_np_pos(fp_pos_data, end_pos_data)) + mysimulator(
+            #     data_new).detach().cpu() * data_new.delta_t.detach().cpu() * data_new.rd_mag
+            #
+            #
+            # for i in dropout_fp_idx: # the index of fp points 0,1,2,...num_fp-1
+            #     observed_fp_pos[i,:2] = pred_pos[i+1,:2]
+
+            # -------------------------- calculate error -----------------#
+            # compute mean L2 error between observed and target positions
+            error = np.linalg.norm(target_pos[1:1+num_fp,:2] - observed_fp_pos[:,:2], axis=1).mean()
+            print("error", error)
+
+            # -------------------------------------------- Calculate offset -------------------------------------#
+            # offset = np.array([])
+            # print("last miss idx", last_drop_fp_idx)
+            # for i in last_drop_fp_idx:
+            #     if i not in dropout_fp_idx:  # the fp that find match in the current frame
+            #         print("Idx find match", i)
+            #         offset = np.array(fp_pos[i, :2]) - np.array(pred_pos[i+1,:2])
+            #         print("Offset", offset)
+
+            # -------------------------------------------- Correct the offset error -------------------------------------#
+
+            # for i in dropout_fp_idx:  # the index of fp points 0,1,2,...num_fp-1
+            #     if offset.size == 0:
+            #         observed_fp_pos[i, :2] = pred_pos[i + 1, :2]
+            #     else:
+            #         observed_fp_pos[i, :2] = pred_pos[i+1, :2]+offset
+
+            # ---------------------------- train the model ---------------------------#
+            #
+            # data_train = get_graph_data(fp_pos_data, (observed_fp_pos[:,:2]-last_pred_fp_pos[:,:2])/delta_t, end_pos_data, end_pos_d_data, delta_t, use_yaw_d=args.use_yaw_d,yaw_scale=args.yaw_scale)
+            # data_train = data_train.to(DEVICE)
+            # pred_train = mysimulator(data_train)
+            # loss_train = loss_fn(pred_train, data_train.y)
+            # print("loss train", loss_train)
+            #
+            #
+            #
+            # # train with adam#
+            # loss_train = loss_fn(pred_train, data_train.y)
+            # optimizer.zero_grad()
+            # loss_train.backward()
+            # optimizer.step()
+            ##
+
+
+            # train with autoRate#
+            #
+            # if args.fast_mode and data_count > 1:  # only check for first data
+            #     loss_train = mysimulator.train_all_subnets(data_train, check_conv=False)
+            # else:
+            #     loss_train = mysimulator.train_all_subnets(data_train, check_conv=True)
+            # mysimulator.exchange_lr()
+            # loss_train_v = mysimulator.train_all_subnets_v(data_train, check_conv=False)
+            # print(f"batch Mine", loss_train)
+            # print(f"batch Mine V", loss_train_v)
+            # #
+            #
+            # pred_train = mysimulator(data_train)
+            #
+            # loss_train = loss_fn(pred_train, data_train.y)
+            # print("loss train", loss_train)
+            #
+            #
+            # if data_count % 2 == 0:
+            #     print("exchange_weights")
+            #     mysimulator.exchange_weights()
+
+
+
+            #--------------------------------------- Visualize ----------------------- #
+
+            x_miss, y_miss = to_pixels(torch.tensor(concat_np_pos(observed_fp_pos[:,:2], end_pos_data[:,:2])), 1920, 1080,
+                                       x_range=(-1, 1), y_range=(-1, 1))
+            image = np.full((1080, 1920, 3), 255, dtype=np.uint8)
+            # Draw blue circles and lines (x_true, y_true)
+            points_true = []
+            for x, y in zip(x_true, y_true):
+                pt = (int(x), int(y))
+                cv2.circle(image, pt, 10, (255, 0, 0), -1)  # Blue
+                points_true.append(pt)
+            for i in range(1, len(points_true)):
+                cv2.line(image, points_true[i - 1], points_true[i], (255, 0, 0), 2)
+
+            # Draw red circles and lines (x_miss, y_miss)
+            try:
+                points_miss = []
+                for x, y in zip(x_miss, y_miss):
+                    pt = (int(x), int(y))
+                    cv2.circle(image, pt, 10, (0, 0, 255), -1)  # Red
+                    points_miss.append(pt)
+                for i in range(1, len(points_miss)):
+                    cv2.line(image, points_miss[i - 1], points_miss[i], (0, 0, 255), 2)
+            except:
+                pass
+
+            # Draw green circles and lines (x_last, y_last)
+            points_target = []
+            for x, y in zip(x_target, y_target):
+                pt = (int(x), int(y))
+                cv2.circle(image, pt, 10, (0, 255, 0), -1)  # Green
+                points_target.append(pt)
+            for i in range(1, len(points_target)):
+                cv2.line(image, points_target[i - 1], points_target[i], (0, 255, 0), 2)
+
+            # Draw the random rectangle (green border)
+            x_rect_pix, y_rect_pix = to_pixels(np.array([[x0, y0], [x1, y1]]), 1920, 1080, x_range=(-1, 1),y_range=(-1, 1))
+            pt1 = tuple(np.array([x_rect_pix[0], y_rect_pix[0]]).astype(int))
+            pt2 = tuple(np.array([x_rect_pix[1], y_rect_pix[1]]).astype(int))
+            cv2.rectangle(image, pt1, pt2, (0, 255, 0), 3)
+
+            cv2.putText(image, "Green: Target", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(image, "Blue: Real State", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+            cv2.putText(image, "Red: Prediction", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            # Text to be written on each frame
+            text = f"Rollout {rollout_idx} - Frame {frame}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            # Put the text on the frame
+            cv2.putText(image, text, (10, 30), font, 1, (0, 0, 255), 2, cv2.LINE_AA)
+
+            out_rollout.write(image)
+            # Show video as it writes
+            cv2.imshow("Rollout", image)
+            # if cv2.waitKey(30) & 0xFF == ord('q'):
+            #     break
+            # elif cv2.waitKey(30) & 0xFF == ord('n'):
+            #     done=True
+
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('n'):
+                done = True
+
+            # --- update last known values ---
+
+            # --- reshape back and insert corrected slice ---
+            # first index is length, then are state_input
+            # [3:27] +1 --> [4:28]
+            observed_state[4:28] = observed_fp_pos.reshape(-1)
+            last_pred_fp_pos = observed_fp_pos.copy()
+            last_drop_fp_idx = dropout_fp_idx
+
+            # check threshold
+            if error < 0.005:
+                done = True
+
+            if done: # Time up (30s), the env and the controller are reset. Next case with different desired shapes.
+
+                #------------------------------- reset env -------------------------#
+                self.controller.reset(state)
+
+                # Keep previous target for comparison
+                prev_target = target_pos.copy()
+
+                # First reset
+                state = self.env.reset()
+                time.sleep(0.1)
+
+                # Check if target changed (compare desired_pos_idx slice)
+                new_target = state[I.desired_pos_idx].reshape(num_fp+2, 3)[:,:2].copy()
+
+                if prev_target is not None and np.allclose(new_target, prev_target, atol=1e-6):
+                    print("[Warning] Target did not change after reset — retrying...")
+                    state = self.env.reset()
+
+                # -------------------------------------------------------------------------------------------------------
+
+                state[I.left_end_avel_idx + I.right_end_avel_idx] /= 2 * np.pi  # change the unit of the input angular velocity from rad/s  to 2pi*rad/s
+
+                state_input, fp_pos, last_pred_fp_pos, observed_state = self.update_state_data(state, num_fp)
+                frame = 0
+                done = False
+                last_drop_fp_idx = []
+
+                re_load_weights(mysimulator,args.model_path)
+                optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, mysimulator.parameters()), lr=args.adam_lr)
+
+
+                # Save the image with a unique filename
+                save_path = os.path.join(save_dir, f"control_result_{rollout_idx}.png")
+                cv2.imwrite(save_path, image)
+                rollout_idx += 1
+                error = np.inf
+
+
+        out_rollout.release()
+        cv2.destroyAllWindows()
+
+
+
+
+# --------------------------------------------------------------------------
+if __name__ == '__main__':
+    try:
+        rospy.init_node("sim_env_node")
+        env = Environment()
+        env.mainLoop()
+
+    except rospy.ROSInterruptException:
+        print("program interrupted before completion.")
