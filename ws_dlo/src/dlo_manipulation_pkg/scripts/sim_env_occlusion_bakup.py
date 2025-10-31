@@ -206,11 +206,11 @@ class Environment(object):
             # y1 = y_max + 0.25*rect_height
             #
 
-            x0 = x_min - 0.5*rect_width
-            y0 = y_min - 0.5*rect_height
+            x0 = x_min - 0*rect_width
+            y0 = y_min - 0*rect_height
 
-            x1 = x_max + 0.5*rect_width
-            y1 = y_max + 0.5*rect_height
+            x1 = x_max + 0*rect_width
+            y1 = y_max + 0*rect_height
 
 
 
@@ -225,9 +225,6 @@ class Environment(object):
 
 
             dropout_fp_idx = list(missing_idx)
-
-            dropout_fp_idx = [2,3,4,5]
-
             lst = [0,1,2,3,4,5,6,7]
             see_fp_idx = [x for x in lst if x not in dropout_fp_idx]
 
@@ -270,6 +267,26 @@ class Environment(object):
 
             # ------------------------------ Correct shape --------------------#
 
+            # fixed_idx = [0,9]+[i+1 for i in see_fp_idx]
+            # print("fixed_idx", fixed_idx)
+            #
+            # wrong_shape, _, _, distances = check_distance_anomalies(np.array(pred_pos[:,:2]),0.02, 0.07)
+            # print("S with spike passes:", wrong_shape)
+            #
+            # if dropout_fp_idx and wrong_shape:
+            #     print("Need to correct shape")
+            #     print("No correction", np.array(pred_pos[:,:2]))
+            #     correct_pos , res = correct_shape(np.array(pred_pos[:,:2]), fixed_idx=fixed_idx,
+            #                                  alpha=10, beta=50.0, gamma=10.0, max_spacing=0.05)
+            #     pred_pos[:, :2] = torch.tensor(correct_pos)
+            #
+            #     print("With correction", np.array(pred_pos[:, :2]))
+            #
+            # for i in dropout_fp_idx: # the index of fp points 0,1,2,...num_fp-1
+            #     observed_fp_pos[i,:2] = pred_pos[i+1,:2]
+            #
+            # print("observed pos", observed_fp_pos[:,:2])
+
 
             for i in dropout_fp_idx: # the index of fp points 0,1,2,...num_fp-1
                 observed_fp_pos[i,:2] = pred_pos[i+1,:2]
@@ -297,8 +314,26 @@ class Environment(object):
             print("observed pos", observed_fp_pos[:,:2])
 
 
-            # ---------------------------- train the model ---------------------------#
+            # -------------------------------------------- Calculate offset -------------------------------------#
+            # offset = np.array([])
+            # for i in last_drop_fp_idx:
+            #     if i not in dropout_fp_idx:  # the fp that find match in the current frame
+            #         print("Idx find match", i)
+            #         offset = np.array(fp_pos[i, :2]) - np.array(pred_pos[i+1,:2])
+            #         print("Offset magnitude", np.linalg.norm(offset))
 
+
+            # -------------------------------------------- Correct the offset error -------------------------------------#
+
+            # for i in dropout_fp_idx:  # the index of fp points 0,1,2,...num_fp-1
+            #     if offset.size == 0:
+            #         observed_fp_pos[i, :2] = pred_pos[i + 1, :2]
+            #     elif np.linalg.norm(offset) > 0.1:
+            #         print("Correct offset")
+            #         observed_fp_pos[i, :2] = pred_pos[i+1, :2]+offset
+
+            # ---------------------------- train the model ---------------------------#
+            #
             data_train = get_graph_data(fp_pos_data, (observed_fp_pos[:,:2]-last_pred_fp_pos[:,:2])/delta_t, end_pos_data, end_pos_d_data, delta_t, use_yaw_d=args.use_yaw_d,yaw_scale=args.yaw_scale)
             data_train = data_train.to(DEVICE)
             pred_train = mysimulator(data_train)
