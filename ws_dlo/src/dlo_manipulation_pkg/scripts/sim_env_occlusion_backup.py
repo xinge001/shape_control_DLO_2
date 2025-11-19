@@ -58,9 +58,9 @@ args = Args(
     num_fp=8,
     fast_mode=False,
     train_nets = [5,6,7,8,9,10,11],
-    setting = 'Drop_246',
-    tag = 'Adam_0.1',
-    adam_lr = 0.1
+    setting = 'Correct_dist_15',
+    tag = 'autoRate_trial_100',
+    adam_lr = 1e-3
 )
 
 
@@ -86,18 +86,6 @@ def re_load_weights (mysimulator, model_path):
             subnet.alpha0 = 0
             subnet.alpha1 = 1
             subnet.lr = args.lr
-
-def lr_times_factor(mysimulator, factor):
-    for i, subnet in enumerate(mysimulator.subnets):
-        if i in args.train_nets:
-            subnet.alpha0 = factor
-            subnet.alpha1 = 0
-
-    for i, subnet in enumerate(mysimulator.subnets_v):
-        if i in args.train_nets:
-            subnet.alpha0 = 0
-            subnet.alpha1 = factor
-
 
 
 class Environment(object):
@@ -150,8 +138,11 @@ class Environment(object):
         out_rollout = cv2.VideoWriter(f"./results/{args.setting}/saved_images_{args.tag}/control_{args.tag}.mp4", fourcc, 5, (1920,1080))
         frame = 0
 
-
-
+        # Before the time-step loop of each rollout
+        prev_error = None
+        stagnation_steps = 0
+        max_stagnation_steps = 10  # e.g. if no change for 20 steps, stop
+        change_tol = 1e-4  # "no change" threshold
 
         # --------------------------------- setup before loop ---------------------------------
         #initialize save data
@@ -160,7 +151,7 @@ class Environment(object):
         drop_mask_all = []
 
         # --------------------------------- Main loop ---------------------------------
-
+        flip_rollout=[]
         rollout_idx = 0
 
         # === Logging containers (T × N × 2 for positions, T × N for masks) ===
@@ -213,8 +204,8 @@ class Environment(object):
             mid_point = (target_pos[4, :2] + target_pos[5, :2]) / 2.0
 
             # Fixed rectangle size
-            rect_width = 0.10
-            rect_height = 0.10
+            rect_width = 0.15
+            rect_height = 0.15
 
             # Compute bounds centered at midpoint
             x0 = mid_point[0] - rect_width / 2
@@ -236,8 +227,8 @@ class Environment(object):
 
             dropout_fp_idx = list(missing_idx)
 
-            dropout_fp_idx = [2,4,6]
-            print("missing_idx", dropout_fp_idx)
+            # dropout_fp_idx = []
+            # print("missing_idx", dropout_fp_idx)
 
             lst = [0,1,2,3,4,5,6,7]
             see_fp_idx = [x for x in lst if x not in dropout_fp_idx]
@@ -278,23 +269,14 @@ class Environment(object):
             error = np.linalg.norm(target_pos[1:1+num_fp,:2] - observed_fp_pos[:,:2], axis=1).mean()
             print("error", error)
 
-            # -------------------------------------------- Calculate offset -------------------------------------#
-            # offset = np.array([])
-            # for i in last_drop_fp_idx:
-            #     if i not in dropout_fp_idx:  # the fp that find match in the current frame
-            #         print("Idx find match", i)
-            #         offset = np.array(fp_pos[i, :2]) - np.array(pred_pos[i+1,:2])
-            #         print("Offset magnitude", np.linalg.norm(offset))
-
-
-            # -------------------------------------------- Correct the offset error -------------------------------------#
-
-            # for i in dropout_fp_idx:  # the index of fp points 0,1,2,...num_fp-1
-            #     if offset.size == 0:
-            #         observed_fp_pos[i, :2] = pred_pos[i + 1, :2]
-            #     elif np.linalg.norm(offset) > 0.1:
-            #         print("Correct offset")
-            #         observed_fp_pos[i, :2] = pred_pos[i+1, :2]+offset
+            # --- check error change ---
+            if prev_error is not None:
+                if abs(error - prev_error) < change_tol:
+                    stagnation_steps += 1
+                else:
+                    stagnation_steps = 0
+            prev_error = error
+            print("error stagnation count", stagnation_steps)
 
             # ------------------------------ Correct shape --------------------#
             # out_of_bound = (
@@ -303,7 +285,7 @@ class Environment(object):
             #         or torch.any(pred_pos[1:-1, 1] < y0)
             #         or torch.any(pred_pos[1:-1, 1] > y1)
             # )
-            # --------------------------------------------bound by the occluded bounding box--------------#
+            # --------------------------------------------Correct shape--------------#
 
             fixed_idx = [0,9]+[i+1 for i in see_fp_idx]
             print("fixed_idx", fixed_idx)
@@ -317,16 +299,17 @@ class Environment(object):
 
             # correct the shape if dist between fps <min_dist or >max_dist
 
+            # wrong_shape
             if dropout_fp_idx and wrong_shape:
-                print("Need to correct shape")
-                print("No correction", np.array(pred_pos[:,:2]))
+                # print("Need to correct shape")
+                # print("No correction", np.array(pred_pos[:,:2]))
                 # correct_pos , res = correct_shape(np.array(pred_pos[:,:2]), fixed_idx=fixed_idx,
                 #                              alpha=10, beta=50.0, gamma=10.0, max_spacing=0.07, min_spacing=0.03, new_spacing=0.05)
                 correct_pos , res = correct_shape(np.array(pred_pos[:,:2]), fixed_idx=fixed_idx,
                                              alpha=0, beta=0, gamma=0, max_spacing=0.07, min_spacing=0.03, new_spacing=0.05)
                 pred_pos[:, :2] = torch.tensor(correct_pos)
 
-                print("With correction", np.array(pred_pos[:, :2]))
+                # print("With correction", np.array(pred_pos[:, :2]))
 
             # reassign observed fp after correction
             for i in dropout_fp_idx: # the index of fp points 0,1,2,...num_fp-1
@@ -381,6 +364,23 @@ class Environment(object):
             #
             # print("observed pos", observed_fp_pos[:,:2])
 
+            # # -------------------------------------------- Calculate offset -------------------------------------#
+            # offset = np.array([])
+            # for i in last_drop_fp_idx:
+            #     if i not in dropout_fp_idx:  # the fp that find match in the current frame
+            #         print("Idx find match", i)
+            #         offset = np.array(fp_pos[i, :2]) - np.array(pred_pos[i+1,:2])
+            #         print("Offset magnitude", np.linalg.norm(offset))
+            #
+            # # -------------------------------------------- Correct the offset error -------------------------------------#
+            #
+            # for i in dropout_fp_idx:  # the index of fp points 0,1,2,...num_fp-1
+            #     if offset.size == 0:
+            #         observed_fp_pos[i, :2] = pred_pos[i + 1, :2]
+            #     elif np.linalg.norm(offset) > 0:
+            #         print("Correct offset")
+            #         observed_fp_pos[i, :2] = pred_pos[i+1, :2]+offset
+
             # ---------------------------- Save Prediction data---------------------------#
             # Build boolean mask for missing FPs this frame (length = num_fp)
             missing_mask = np.zeros(num_fp, dtype=bool)
@@ -397,46 +397,55 @@ class Environment(object):
             log["missing_mask"].append(missing_mask.copy())
             log["frame"].append(int(frame))
 
+            fp_true_vel = observed_state[48:72].reshape(num_fp,-1)
+            print("max_vel", np.nanmax(fp_true_vel))
+            if np.nanmax(fp_true_vel) > 0.3 and rollout_idx not in flip_rollout:
+                flip_rollout.append(rollout_idx)
+            print("flip_rollout", flip_rollout)
+
             # ---------------------------- train the model ---------------------------#
 
             data_train = get_graph_data(fp_pos_data, (observed_fp_pos[:,:2]-last_pred_fp_pos[:,:2])/delta_t, end_pos_data, end_pos_d_data, delta_t, use_yaw_d=args.use_yaw_d,yaw_scale=args.yaw_scale)
             data_train = data_train.to(DEVICE)
             pred_train = mysimulator(data_train)
             loss_train = loss_fn(pred_train, data_train.y)
-            #
+
+
             # train_idx  = [x+1 for x in see_fp_idx]
             # print("train idx", train_idx)
 
-            # # train with adam#
-            if np.all(np.abs(observed_fp_pos[:,:2]-last_pred_fp_pos[:,:2])/delta_t<0.1) :
-                loss_train = loss_fn(pred_train, data_train.y)
-                optimizer.zero_grad()
-                loss_train.backward()
-                optimizer.step()
 
-            # train with autoRate#
+            # # train with adam#
             # if np.all(np.abs(observed_fp_pos[:,:2]-last_pred_fp_pos[:,:2])/delta_t<0.1):
-            #     if args.fast_mode and data_count > 1:  # only check for first data
-            #         loss_train = mysimulator.train_all_subnets(data_train, check_conv=False)
-            #     else:
-            #         loss_train = mysimulator.train_all_subnets(data_train, check_conv=True)
-            #     mysimulator.exchange_lr()
-            #     loss_train_v = mysimulator.train_all_subnets_v(data_train, check_conv=False)
-            #
-            #
-            #     # print(f"batch Mine", loss_train)
-            #     # print(f"batch Mine V", loss_train_v)
-            #     #
-            #
-            #     pred_train = mysimulator(data_train)
-            #
+            #     print("train")
             #     loss_train = loss_fn(pred_train, data_train.y)
-            #     # print("loss train", loss_train)
-            #
-            #
-            #     if data_count % 2 == 0:
-            #         # print("exchange_weights")
-            #         mysimulator.exchange_weights()
+            #     optimizer.zero_grad()
+            #     loss_train.backward()
+            #     optimizer.step()
+
+            #train with autoRate#
+            if np.all(np.abs(observed_fp_pos[:, :2] - last_pred_fp_pos[:, :2]) / delta_t < 0.1):
+                if args.fast_mode and data_count > 1:  # only check for first data
+                    loss_train = mysimulator.train_all_subnets(data_train, check_conv=False)
+                else:
+                    loss_train = mysimulator.train_all_subnets(data_train, check_conv=True)
+                mysimulator.exchange_lr()
+                loss_train_v = mysimulator.train_all_subnets_v(data_train, check_conv=False)
+
+
+                # print(f"batch Mine", loss_train)
+                # print(f"batch Mine V", loss_train_v)
+                #
+
+                pred_train = mysimulator(data_train)
+
+                loss_train = loss_fn(pred_train, data_train.y)
+                # print("loss train", loss_train)
+
+
+                if data_count % 2 == 0:
+                    # print("exchange_weights")
+                    mysimulator.exchange_weights()
 
             #--------------------------------------- Visualize ----------------------- #
 
@@ -474,10 +483,10 @@ class Environment(object):
                 cv2.line(image, points_target[i - 1], points_target[i], (0, 255, 0), 2)
 
             # Draw the occluded rectangle (green border)
-            # x_rect_pix, y_rect_pix = to_pixels(np.array([[x0, y0], [x1, y1]]), 1920,1080, x_range=(-1, 1),y_range=(-1, 1))
-            # pt1 = tuple(np.array([x_rect_pix[0], y_rect_pix[0]]).astype(int))
-            # pt2 = tuple(np.array([x_rect_pix[1], y_rect_pix[1]]).astype(int))
-            # cv2.rectangle(image, pt1, pt2, (0, 255, 0), 3)
+            x_rect_pix, y_rect_pix = to_pixels(np.array([[x0, y0], [x1, y1]]), 1920,1080, x_range=(-1, 1),y_range=(-1, 1))
+            pt1 = tuple(np.array([x_rect_pix[0], y_rect_pix[0]]).astype(int))
+            pt2 = tuple(np.array([x_rect_pix[1], y_rect_pix[1]]).astype(int))
+            cv2.rectangle(image, pt1, pt2, (0, 255, 0), 3)
 
             cv2.putText(image, "Green: Target", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             cv2.putText(image, "Blue: Real State", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
@@ -511,10 +520,11 @@ class Environment(object):
 
             # --- update last known values ---
             last_pred_fp_pos = observed_fp_pos.copy()
-            last_drop_fp_idx = dropout_fp_idx
+            last_drop_fp_idx = dropout_fp_idx.copy()
 
-
-            if done or error<0.01: # Time up (30s), the env and the controller are reset. Next case with different desired shapes.
+            # error<0.0001
+            # or stagnation_steps >= max_stagnation_steps
+            if done or stagnation_steps >= max_stagnation_steps: # Time up (30s), the env and the controller are reset. Next case with different desired shapes.
 
                 # Stack lists → arrays: observed_xy/true_xy shape (T, N, 2), missing_mask shape (T, N)
                 observed_xy = np.stack(log["observed_xy"], axis=0)
@@ -577,6 +587,12 @@ class Environment(object):
                     "missing_mask": [],  # bool mask (True where FP is missing) for each frame
                     "frame": [],  # frame indices (optional)
                 }
+
+                # Before the time-step loop of each rollout
+                prev_error = None
+                stagnation_steps = 0
+                max_stagnation_steps = 10  # e.g. if no change for 20 steps, stop
+                change_tol = 1e-4  # "no change" threshold
 
         out_rollout.release()
         cv2.destroyAllWindows()
