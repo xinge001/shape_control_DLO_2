@@ -20,7 +20,7 @@ target_points_idx = rospy.get_param("controller/object_fps_idx")
 
 
 # ------------------------------------------------------------------------------
-def evaluateControlResults(names, num_case=20, delta_t=0.1):
+def evaluateControlResults(names, num_case=50, delta_t=0.1):
 
     env_dim = rospy.get_param("env/dimension")
     
@@ -35,19 +35,33 @@ def evaluateControlResults(names, num_case=20, delta_t=0.1):
 
     all_success = np.zeros((num_case, len(names)))
     k = 0
+    total_count = 0
+    flip_rollout = []
     for name in names:
         task_error_success = []
         task_error_all = []
         task_time = []
         success = 0
         for i in range(num_case):
+            # [2,7,11,15,18,25,28,33,39,41]
+            # [2, 10, 11, 15, 24, 25, 27, 29, 31, 32, 33, 34, 39, 42, 43, 44, 48, 51, 54, 55, 60, 65, 71, 72, 74, 80, 82, 86, 89, 90, 92, 95, 96, 98]
+            # [2, 3, 5, 7, 8, 9, 10, 11, 15, 16, 18, 20, 24, 25, 26, 27, 29, 32, 33, 34, 38, 39, 40, 41, 42, 43, 44, 45,48]
+            # if i in [2, 10, 11, 15, 24, 25, 27, 29, 31, 32, 33, 34, 39, 42, 43, 44, 48, 51, 54, 55, 60, 65, 71, 72, 74, 80, 82, 86, 89, 90, 92, 95, 96, 98]:
+            #     continue
             if env == 'sim':
                 # state = np.load(project_dir + "results/" + env + "/control/" + name + "/" + env_dim  + "/state_" + str(i) + ".npy")
                 state = np.load(
-                    project_dir + "results/" + env + "/control/" + name + "/Drop_246" + "/Adam_0.1" + "/state_" + str(i) + ".npy")
-                # state = np.load(project_dir + "results/" + env + "/control/" + name + "/" + "RBF_baseline"  + "/state_" + str(i) + ".npy")
+                    project_dir + "results/" + env + "/control/" + name + "/No_correct_15" + "/autoRate" + "/state_" + str(i) + ".npy")
+
             desired_positions = state[-1, I.desired_pos_idx] 
             positions = state[:, I.fps_pos_idx]
+
+            # fp_true_vel = state[:, 48:72].reshape(-1,8,3)
+            # print("max_vel", np.nanmax(fp_true_vel))
+            #
+            # if np.nanmax(fp_true_vel) > 0.3 and i not in flip_rollout:
+            #     flip_rollout.append(i)
+            # print("flip_rollout", flip_rollout)
 
             error = np.linalg.norm((positions - desired_positions)[:, target_dim], axis=1)
 
@@ -62,10 +76,23 @@ def evaluateControlResults(names, num_case=20, delta_t=0.1):
                 all_success[i, k] = 1
                 time = np.min(np.where(error < threshold)) * delta_t
                 task_time.append(time)
-                task_error_success.append( np.min(error[-control_rate : -1]))
+                task_error_success.append(np.mean(error[-2 : -1]))
+
+            # offline
+            # [2, 3, 7, 9, 10, 11, 15, 18, 24, 25, 27, 28, 29, 31, 32, 33, 34, 38, 40, 41, 42, 43, 44, 45, 48]
+            # autoRate
+            # [2, 3, 5, 9, 10, 11, 15, 18, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 36, 38, 39, 40, 41, 42, 43, 44, 48]
+            # Adam_0.1 [2, 3, 9, 10, 11, 15, 18, 24, 25, 27, 28, 29, 31, 32, 33, 34, 36, 38, 39, 40, 41, 42, 43, 44, 45, 48]
+            # adam_1e4 [2, 3, 9, 10, 11, 13, 15, 18, 24, 25, 27, 28, 29, 31, 32, 33, 34, 36, 38, 39, 41, 42, 44, 45, 48]
+            # [2, 3, 5, 9, 10, 11, 13, 15, 18, 24, 25, 27, 28, 29, 31, 32, 33, 34, 36, 38, 39, 41, 42, 43, 44, 45, 48, 51, 54, 55, 58, 60, 64, 65, 71, 72, 74, 80, 82, 83, 86, 87, 89, 95, 96, 97, 98]
+            # [2, 3, 7, 9, 10, 11, 15, 18, 24, 25, 27, 28, 29, 31, 32, 33, 34, 38, 40, 41, 42, 43, 44, 45, 48, 51, 54, 55, 60, 64, 71, 72, 74, 80, 82, 83, 86, 87, 89, 95, 96, 97, 98]
+            # [2, 10, 11, 15, 24, 25, 27, 29, 31, 32, 33, 34, 39, 42, 43, 44, 48, 51, 54, 55, 60, 65, 71, 72, 74, 80, 82, 86, 89, 90, 92, 95, 96, 98]
+            else:
+                print("unsuccessful", i)
+            total_count += 1
 
             # for all cases (not just successful cases)
-            task_error_all.append( np.min(error[-control_rate : -1]))
+            task_error_all.append( np.mean(error[-2 : -1]))
 
         if task_error_success == []:
               ave_task_error_success = 0
@@ -81,6 +108,7 @@ def evaluateControlResults(names, num_case=20, delta_t=0.1):
         np.save(project_dir + "results/" + env + "/control/" + name + "/" + env_dim + "/ave.npy", ave_result)
 
         k += 1
+        print("total case", total_count)
 
 
 

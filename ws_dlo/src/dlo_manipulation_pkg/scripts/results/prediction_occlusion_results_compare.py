@@ -22,7 +22,7 @@ from typing import List, Dict, Any
 
 import numpy as np
 import pandas as pd
-
+import re
 
 def load_npz(path: str) -> Dict[str, np.ndarray]:
     d = np.load(path)
@@ -175,8 +175,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    setting = 'Drop_246'
-    tag = "Adam_0.1"
+    setting = 'No_correct_15'
+    tag = "autoRate"
 
     args.path = f"./{setting}/saved_DLO_prediction/{tag}"
     args.outdir = f"./{setting}/saved_DLO_prediction/{tag}"
@@ -185,8 +185,40 @@ def main():
         files = sorted(glob.glob(os.path.join(args.path, args.pattern)))
     else:
         files = [args.path] if args.path.endswith(".npz") else []
+
+
+    # You can hard-code or read from args, e.g. args.exclude_ids
+    # exclude_list_1 = {2, 10, 11, 15, 24, 25, 27, 29, 31, 32, 33, 34, 39, 42, 43, 44, 48, 51, 54, 55, 60, 65, 71, 72, 74, 80, 82, 86, 89, 90, 92, 95, 96, 98}   # example: exclude rollouts 0, 3, 7
+    # # exclude_list_1 = {2,7,11,15,18,25,28,33,39,41}
+    # exclude_list_2 = set(range(50, 101))   # includes 50 to 100 inclusive
+    #
+    # exclude_list = exclude_list_1 | exclude_list_2
+
+    exclude_list=set(range(50, 101))
+
+
+    filtered_files = []
+    pattern_last_num = re.compile(r'(\d+)(?=\.[^.]+$)')  # digits before extension
+
+    for fpath in files:
+        fname = os.path.basename(fpath)
+        m = pattern_last_num.search(fname)
+        if m:
+            last_num = int(m.group(1))
+            # Skip file if its last number is in exclude_list
+            if last_num in exclude_list:
+                print(f"[INFO] Skipping {fname} (last_num={last_num} in exclude_list)")
+                continue
+        # Keep files with no number or number not in exclude_list
+        filtered_files.append(fpath)
+
+    files = filtered_files
+
+
     if not files:
         raise SystemExit(f"No NPZ files found for path={args.path} (pattern={args.pattern})")
+
+
 
     print(f"[INFO] Found {len(files)} file(s). Computing errors with scale={args.scale}...")
     summary_df = process_files(files, args.outdir, scale=args.scale)
