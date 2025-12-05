@@ -49,7 +49,7 @@ class Args:
 args = Args(
     lr=1,
     outf="occlusion_results/adam_offline_yaw_d",
-    model_path="occlusion_models/net_epoch_100_iter_1856.pth",
+    model_path="occlusion_models/adam_offline_yaw_d_simulation_filter_l_0.3/net_epoch_99_iter_93.pth",
     resume_epoch=0,
     n_epoch=200,
     batch_size=32,
@@ -60,8 +60,8 @@ args = Args(
     num_fp=8,
     fast_mode=False,
     train_nets = [5,6,7,8,9,10,11],
-    setting = 'Trial',
-    tag = 'offline',
+    setting = 'offline_l0.3',
+    tag = 'online',
     adam_lr = 1e-6
 )
 
@@ -429,28 +429,28 @@ class Environment(object):
             #     optimizer.step()
 
             #train with autoRate#
-            # if np.all(np.abs(observed_fp_pos[:, :2] - last_pred_fp_pos[:, :2]) / delta_t < 0.1):
-            #     if args.fast_mode and data_count > 1:  # only check for first data
-            #         loss_train = mysimulator.train_all_subnets(data_train, check_conv=False)
-            #     else:
-            #         loss_train = mysimulator.train_all_subnets(data_train, check_conv=True)
-            #     mysimulator.exchange_lr()
-            #     loss_train_v = mysimulator.train_all_subnets_v(data_train, check_conv=False)
-            #
-            #
-            #     # print(f"batch Mine", loss_train)
-            #     # print(f"batch Mine V", loss_train_v)
-            #     #
-            #
-            #     pred_train = mysimulator(data_train)
-            #
-            #     loss_train = loss_fn(pred_train, data_train.y)
-            #     # print("loss train", loss_train)
-            #
-            #
-            #     if data_count % 2 == 0:
-            #         # print("exchange_weights")
-            #         mysimulator.exchange_weights()
+            if np.all(np.abs(observed_fp_pos[:, :2] - last_pred_fp_pos[:, :2]) / delta_t < 0.1):
+                if args.fast_mode and data_count > 1:  # only check for first data
+                    loss_train = mysimulator.train_all_subnets(data_train, check_conv=False)
+                else:
+                    loss_train = mysimulator.train_all_subnets(data_train, check_conv=True)
+                mysimulator.exchange_lr()
+                loss_train_v = mysimulator.train_all_subnets_v(data_train, check_conv=False)
+
+
+                # print(f"batch Mine", loss_train)
+                # print(f"batch Mine V", loss_train_v)
+                #
+
+                pred_train = mysimulator(data_train)
+
+                loss_train = loss_fn(pred_train, data_train.y)
+                # print("loss train", loss_train)
+
+
+                if data_count % 2 == 0:
+                    # print("exchange_weights")
+                    mysimulator.exchange_weights()
 
             #--------------------------------------- Visualize ----------------------- #
 
@@ -518,7 +518,11 @@ class Environment(object):
                 x2_tar = cx + rect_w // 2
                 y2_tar = cy + rect_h // 2
 
-                cv2.rectangle(image, (x1_tar, y1_tar), (x2_tar, y2_tar), (0, 255, 0), -1)  # filled green rectangle
+                # cv2.rectangle(image, (x1_tar, y1_tar), (x2_tar, y2_tar), (0, 255, 0), -1)  # filled green rectangle
+
+                radius = 10
+                cv2.circle(image, (cx,cy), radius, (0, 255, 0), -1)  # Red
+
                 points_target.append((cx, cy))
 
             # Draw connecting lines
